@@ -23,9 +23,12 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   "https://yashmalik.tech,https://codeblech.github.io,http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
 ).split(',');
 
-// Middleware
-app.use(express.json());
-app.use(express.raw({ type: 'application/octet-stream', limit: '10mb' }));
+// Middleware - handle both JSON and raw/encrypted payloads
+// Don't parse body automatically - we'll handle it manually in the proxy handler
+app.use(express.raw({
+  type: '*/*',  // Accept all content types
+  limit: '10mb'
+}));
 
 /**
  * Check if the request origin is allowed
@@ -178,10 +181,21 @@ app.all('/proxy*', async (req, res) => {
       headers: proxyHeaders,
     };
 
-    // Add body for POST requests
-    if (req.method === 'POST' && req.body) {
-      fetchOptions.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-      console.log(`Body length: ${fetchOptions.body.length} bytes`);
+    // Add body for POST requests (and other methods that support body)
+    // The body comes as a Buffer from express.raw(), convert to string
+    if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body && req.body.length > 0) {
+      if (Buffer.isBuffer(req.body)) {
+        fetchOptions.body = req.body.toString('utf-8');
+        console.log(`Body type: Buffer (encrypted/serialized payload)`);
+        console.log(`Body length: ${fetchOptions.body.length} bytes`);
+        console.log(`Body preview: ${fetchOptions.body.substring(0, 50)}...`);
+      } else {
+        fetchOptions.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+        console.log(`Body type: ${typeof req.body}`);
+        console.log(`Body length: ${fetchOptions.body.length} bytes`);
+      }
+    } else if (req.method === 'POST') {
+      console.log(`No body in POST request`);
     }
 
     console.log(`[${timestamp}] Forwarding to JIIT API...`);
