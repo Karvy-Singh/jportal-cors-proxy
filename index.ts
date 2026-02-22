@@ -1,22 +1,10 @@
 /**
- * JIIT Web Portal CORS Proxy - Cloudflare Worker (ARCHIVED - NON-FUNCTIONAL)
+ * JIIT Web Portal CORS Proxy - Cloudflare Worker
  *
- * ⚠️ THIS IMPLEMENTATION DOES NOT WORK ⚠️
- *
- * Reason: Cloudflare Workers cannot proxy requests to specific ports.
- * JIIT's API runs on port 6011 (https://webportal.jiit.ac.in:6011), but Cloudflare Workers
- * can only make requests to standard ports (80 for HTTP, 443 for HTTPS).
- *
- * When attempting to fetch from https://webportal.jiit.ac.in:6011, Cloudflare Workers
- * will strip the port and make the request to https://webportal.jiit.ac.in:443 instead,
- * which fails.
- *
- * Solution: Use the Node.js/Express version (server.js) which can be deployed on Render
- * or any Node.js hosting platform that supports custom ports.
- *
- * This file is kept for reference purposes only.
- *
- * Date archived: 2026-01-16
+ * Current expectation:
+ * - Worker ingress remains on standard HTTPS.
+ * - Worker egress can fetch the configured JIIT backend, including port 6011
+ *   when Wrangler compatibility enables custom ports (allow_custom_ports).
  */
 
 interface Env {
@@ -79,11 +67,33 @@ function getCorsHeaders(origin: string | null, allowedOrigins: string[]): Record
  */
 function isValidJiitUrl(url: string, apiBase: string): boolean {
   try {
-    // Check if the URL starts with JIIT_API_BASE (which may include path)
-    return url.startsWith(apiBase);
+    const parsedApiBase = new URL(apiBase);
+    const parsedTarget = new URL(url);
+    return (
+      parsedTarget.protocol === parsedApiBase.protocol &&
+      parsedTarget.hostname === parsedApiBase.hostname &&
+      parsedTarget.port === parsedApiBase.port &&
+      parsedTarget.pathname.startsWith(parsedApiBase.pathname)
+    );
   } catch {
     return false;
   }
+}
+
+function buildTargetUrl(apiBase: string, targetPath: string): string {
+  const base = new URL(apiBase);
+  const normalizedTargetPath = targetPath.startsWith("/") ? targetPath : `/${targetPath}`;
+  const basePath = base.pathname.endsWith("/") ? base.pathname.slice(0, -1) : base.pathname;
+
+  let finalPath = normalizedTargetPath;
+  if (normalizedTargetPath.startsWith(`${basePath}/`) || normalizedTargetPath === basePath) {
+    finalPath = normalizedTargetPath;
+  } else {
+    finalPath = `${basePath}${normalizedTargetPath}`;
+  }
+
+  base.pathname = finalPath;
+  return base.toString();
 }
 
 /**
@@ -154,13 +164,7 @@ async function handleRequest(
       });
     }
 
-    // Ensure path starts with /
-    if (!targetPath.startsWith("/")) {
-      targetPath = "/" + targetPath;
-    }
-
-    // Construct the full JIIT API URL
-    const targetUrl = `${apiBase}${targetPath}`;
+    const targetUrl = buildTargetUrl(apiBase, targetPath);
     console.log(`Target URL: ${targetUrl}`);
 
     // Validate it's a JIIT URL (security check)
@@ -175,8 +179,10 @@ async function handleRequest(
     // Prepare headers for the proxied request
     const proxyHeaders = new Headers();
     proxyHeaders.set("Content-Type", request.headers.get("Content-Type") || "application/json");
-    proxyHeaders.set("Origin", "https://webportal.jiit.ac.in:6011"); // Make JIIT think this is same-origin (just origin, no path)
-    proxyHeaders.set("Referer", "https://webportal.jiit.ac.in:6011/"); // Add referer to look more legitimate
+    const upstreamBase = new URL(apiBase);
+    const upstreamOrigin = `${upstreamBase.protocol}//${upstreamBase.host}`;
+    proxyHeaders.set("Origin", upstreamOrigin);
+    proxyHeaders.set("Referer", `${upstreamOrigin}/`);
     proxyHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
     // Forward custom headers
@@ -287,9 +293,8 @@ export default {
           },
           allowedOrigins: ALLOWED_ORIGINS,
           targetApi: JIIT_API_BASE,
-          note: "Cloudflare Worker version - ARCHIVED (cannot proxy to port 6011)",
-          status: "NON-FUNCTIONAL",
-          workingAlternative: "Use Node.js version (server.js) deployed on Render",
+          note: "Cloudflare Worker version",
+          status: "ACTIVE",
         }, null, 2),
         {
           headers: {
@@ -304,7 +309,7 @@ export default {
       const healthStatus = {
         status: "healthy",
         timestamp: new Date().toISOString(),
-        note: "Health endpoint available but proxy is non-functional (port 6011 limitation)",
+        note: "Proxy endpoint is active",
       };
       console.log(`[${healthStatus.timestamp}] Health check`);
       return new Response(JSON.stringify(healthStatus, null, 2), {
