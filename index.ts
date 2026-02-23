@@ -10,6 +10,7 @@
 interface Env {
   JIIT_API_BASE?: string;
   ALLOWED_ORIGINS?: string;
+  UPSTREAM_TIMEOUT_MS?: string;
 }
 
 // Default configuration (can be overridden by environment variables)
@@ -22,6 +23,7 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",         // alternative local dev
   "http://127.0.0.1:4173",         // alternative preview
 ];
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 15000;
 
 /**
  * Get configuration from environment or defaults
@@ -31,8 +33,9 @@ function getConfig(env: Env) {
   const ALLOWED_ORIGINS = env.ALLOWED_ORIGINS
     ? env.ALLOWED_ORIGINS.split(',')
     : DEFAULT_ALLOWED_ORIGINS;
+  const UPSTREAM_TIMEOUT_MS = Number(env.UPSTREAM_TIMEOUT_MS || DEFAULT_UPSTREAM_TIMEOUT_MS);
 
-  return { JIIT_API_BASE, ALLOWED_ORIGINS };
+  return { JIIT_API_BASE, ALLOWED_ORIGINS, UPSTREAM_TIMEOUT_MS };
 }
 
 // CORS headers
@@ -96,6 +99,23 @@ function buildTargetUrl(apiBase: string, targetPath: string): string {
   return base.toString();
 }
 
+function headersToObject(headers: Headers): Record<string, string> {
+  return Object.fromEntries(headers.entries());
+}
+
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const withCause = error as Error & { cause?: unknown };
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      cause: withCause.cause,
+    };
+  }
+  return { value: String(error) };
+}
+
 /**
  * Handle OPTIONS preflight requests
  */
@@ -128,7 +148,8 @@ async function handleOptions(request: Request, allowedOrigins: string[]): Promis
 async function handleRequest(
   request: Request,
   apiBase: string,
-  allowedOrigins: string[]
+  allowedOrigins: string[],
+  upstreamTimeoutMs: number
 ): Promise<Response> {
   const origin = request.headers.get("Origin");
   const url = new URL(request.url);
@@ -197,44 +218,54 @@ async function handleRequest(
       console.log(`LocalName header present: ${localName.substring(0, 20)}...`);
     }
 
-    console.log(`Headers being sent to JIIT:`);
-    console.log(JSON.stringify(Object.fromEntries(proxyHeaders.entries()), null, 2));
-
-    // Get request body for POST/PUT/PATCH
+    // Capture request body once so we can both log and forward exactly.
     let body: string | null = null;
     if (["POST", "PUT", "PATCH"].includes(request.method)) {
       body = await request.text();
-      if (body) {
-        console.log(`Body type: ${typeof body}`);
-        console.log(`Body length: ${body.length} bytes`);
-        console.log(`Body preview: ${body.substring(0, 50)}...`);
-      } else {
-        console.log(`No body in ${request.method} request`);
-      }
     }
 
-    console.log(`[${timestamp}] Forwarding to JIIT API...`);
-
-    // Fetch from JIIT API
-    const response = await fetch(targetUrl, {
+    const upstreamRequestLog = {
+      timestamp,
       method: request.method,
-      headers: proxyHeaders,
-      body: body,
-    });
+      url: targetUrl,
+      headers: headersToObject(proxyHeaders),
+      bodyLength: body?.length || 0,
+      body,
+    };
+    console.log(`[${timestamp}] ===== Upstream Request =====`);
+    console.log(JSON.stringify(upstreamRequestLog, null, 2));
 
-    console.log(`[${timestamp}] Response from JIIT: ${response.status} ${response.statusText}`);
-    console.log(`Response headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}`);
+    console.log(`[${timestamp}] Forwarding to JIIT API (timeout ${upstreamTimeoutMs}ms)...`);
 
-    // Get response body
-    const responseText = await response.text();
-    console.log(`Response body length: ${responseText.length} bytes`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort(`Upstream timeout after ${upstreamTimeoutMs}ms`);
+    }, upstreamTimeoutMs);
 
-    // Log response body for debugging (especially for errors)
-    if (response.status >= 400 || responseText.length < 500) {
-      console.log(`Response body: ${responseText}`);
-    } else {
-      console.log(`Response body preview: ${responseText.substring(0, 200)}...`);
+    let response: Response;
+    try {
+      // Fetch from JIIT API
+      response = await fetch(targetUrl, {
+        method: request.method,
+        headers: proxyHeaders,
+        body: body,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
     }
+
+    const responseText = await response.text();
+    const upstreamResponseLog = {
+      timestamp: new Date().toISOString(),
+      status: response.status,
+      statusText: response.statusText,
+      headers: headersToObject(response.headers),
+      bodyLength: responseText.length,
+      body: responseText,
+    };
+    console.log(`[${timestamp}] ===== Upstream Response =====`);
+    console.log(JSON.stringify(upstreamResponseLog, null, 2));
 
     // Create a new response with CORS headers
     const proxyResponse = new Response(responseText, {
@@ -260,13 +291,19 @@ async function handleRequest(
     return proxyResponse;
   } catch (error) {
     console.error(`[${timestamp}] ===== Proxy Error =====`);
-    console.error(`Error type: ${error instanceof Error ? error.constructor.name : 'Unknown'}`);
-    console.error(`Error message: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    console.error(`Error stack: ${error instanceof Error ? error.stack : 'No stack trace'}`);
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      error: serializeError(error),
+      note: "Error during upstream fetch or proxy handling",
+    }, null, 2));
     console.error(`===== End Error =====\n`);
 
+    const isTimeout =
+      (error instanceof DOMException && error.name === "AbortError") ||
+      (error instanceof Error && error.message.includes("timeout"));
+
     return new Response(`Proxy error: ${error instanceof Error ? error.message : "Unknown error"}`, {
-      status: 502,
+      status: isTimeout ? 504 : 502,
       headers: getCorsHeaders(origin, allowedOrigins),
     });
   }
@@ -278,7 +315,7 @@ async function handleRequest(
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const { JIIT_API_BASE, ALLOWED_ORIGINS } = getConfig(env);
+    const { JIIT_API_BASE, ALLOWED_ORIGINS, UPSTREAM_TIMEOUT_MS } = getConfig(env);
 
     // Handle root path - return info page
     if (url.pathname === "/" || url.pathname === "") {
@@ -292,9 +329,10 @@ export default {
             method2: "/proxy/StudentPortalAPI/endpoint",
           },
           allowedOrigins: ALLOWED_ORIGINS,
-          targetApi: JIIT_API_BASE,
-          note: "Cloudflare Worker version",
-          status: "ACTIVE",
+            targetApi: JIIT_API_BASE,
+            upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+            note: "Cloudflare Worker version",
+            status: "ACTIVE",
         }, null, 2),
         {
           headers: {
@@ -328,7 +366,7 @@ export default {
     // Handle proxy requests
     if (url.pathname.startsWith("/proxy")) {
       if (request.method === "GET" || request.method === "HEAD" || request.method === "POST") {
-        return handleRequest(request, JIIT_API_BASE, ALLOWED_ORIGINS);
+        return handleRequest(request, JIIT_API_BASE, ALLOWED_ORIGINS, UPSTREAM_TIMEOUT_MS);
       } else {
         return new Response(null, {
           status: 405,
